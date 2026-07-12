@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  monitor:
+    build: .
+    container_name: server-monitor
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc/x-ui/x-ui.db:/etc/x-ui/x-ui.db
+      - /usr/local/s-ui/db:/usr/local/s-ui/db
+      - /usr/local/bin/xui-reload.sh:/usr/local/bin/xui-reload.sh:ro
+    # All configuration + secrets live in .env (never commit it — see .env.example)
+    env_file: .env
+    # Map the s-ui panel's cert domain to the host so the container can reach its API.
+    # Adjust to your s-ui domain:host-ip.
+    extra_hosts:
+      - "suip.sparkycloud.ir:91.107.182.219"
+    pid: host
