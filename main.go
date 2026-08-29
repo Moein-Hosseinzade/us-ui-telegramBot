@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -77,6 +78,38 @@ func getEnvInt(key string, def int) int {
 var httpClient = &http.Client{
 	Timeout:   20 * time.Second,
 	Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+}
+
+// panelMu serializes panel-mutating operations (create/enable/disable/delete/
+// renew on x-ui or s-ui) so a reload/restart triggered by one action can't
+// overlap with another action's API call to the same panel.
+var panelMu sync.Mutex
+
+// doWithRetry sends req and, on a transient network error (not an HTTP-level
+// failure), retries once after a short delay. This covers the case where the
+// panel is momentarily unreachable because a previous action just restarted
+// it via reloadXray/suiRestartCore.
+func doWithRetry(client *http.Client, req *http.Request) (*http.Response, error) {
+	const maxAttempts = 2
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			if req.GetBody != nil {
+				body, err := req.GetBody()
+				if err != nil {
+					return nil, err
+				}
+				req.Body = body
+			}
+			time.Sleep(2 * time.Second)
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 func init() {
@@ -279,7 +312,7 @@ func addXUIUser(email string, inboundIDs []int64, days int, gbLimit int64) (*XUI
 	req.Header.Set("Authorization", "Bearer "+xuiAPIToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
+	resp, err := doWithRetry(httpClient, req)
 	if err != nil {
 		return nil, fmt.Errorf("x-ui API request failed: %w", err)
 	}
@@ -302,7 +335,12 @@ func addXUIUser(email string, inboundIDs []int64, days int, gbLimit int64) (*XUI
 }
 
 func reloadXray() error {
-	out, err := exec.Command("/usr/local/bin/xui-reload.sh").CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/usr/local/bin/xui-reload.sh").CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("xui-reload: timed out after 30s — %s", strings.TrimSpace(string(out)))
+	}
 	if err != nil {
 		return fmt.Errorf("xui-reload: %w — %s", err, string(out))
 	}
@@ -630,7 +668,7 @@ func xuiAPIPost(path string, body any) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+xuiAPIToken)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := httpClient.Do(req)
+	resp, err := doWithRetry(httpClient, req)
 	if err != nil {
 		return err
 	}
@@ -903,7 +941,8 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			send(bot, chatID, "❌ Please send a valid number of days (0 = never). Renew cancelled.")
 			return
 		}
-		doUserRenew(bot, chatID, name, days)
+		send(bot, chatID, "⏳ Renewing...")
+		go doUserRenew(bot, chatID, name, days)
 		return
 	}
 
@@ -1006,13 +1045,16 @@ func handleCallback(bot *tgbotapi.BotAPI, cb *tgbotapi.CallbackQuery) {
 		showDeleteConfirm(bot, chatID, msgID, strings.TrimPrefix(data, "uact:delask:"))
 		return
 	case strings.HasPrefix(data, "uact:enable:"):
-		doUserAction(bot, chatID, msgID, "enable", strings.TrimPrefix(data, "uact:enable:"))
+		editText(bot, chatID, msgID, "⏳ Enabling...")
+		go doUserAction(bot, chatID, msgID, "enable", strings.TrimPrefix(data, "uact:enable:"))
 		return
 	case strings.HasPrefix(data, "uact:disable:"):
-		doUserAction(bot, chatID, msgID, "disable", strings.TrimPrefix(data, "uact:disable:"))
+		editText(bot, chatID, msgID, "⏳ Disabling...")
+		go doUserAction(bot, chatID, msgID, "disable", strings.TrimPrefix(data, "uact:disable:"))
 		return
 	case strings.HasPrefix(data, "uact:delete:"):
-		doUserAction(bot, chatID, msgID, "delete", strings.TrimPrefix(data, "uact:delete:"))
+		editText(bot, chatID, msgID, "⏳ Deleting...")
+		go doUserAction(bot, chatID, msgID, "delete", strings.TrimPrefix(data, "uact:delete:"))
 		return
 	case strings.HasPrefix(data, "uact:renew:"):
 		name := strings.TrimPrefix(data, "uact:renew:")
@@ -1337,6 +1379,8 @@ func createSUIPart(w *wizardState) string {
 }
 
 func createUser(bot *tgbotapi.BotAPI, chatID int64, w *wizardState) {
+	panelMu.Lock()
+	defer panelMu.Unlock()
 	var parts []string
 	if (w.panel == panelXUI || w.panel == panelBoth) && len(w.xuiIDs) > 0 {
 		parts = append(parts, createXUIPart(w))
@@ -1483,6 +1527,8 @@ func showUserManage(bot *tgbotapi.BotAPI, chatID int64, msgID int, name string) 
 }
 
 func doUserAction(bot *tgbotapi.BotAPI, chatID int64, msgID int, action, name string) {
+	panelMu.Lock()
+	defer panelMu.Unlock()
 	u, err := findUser(name)
 	if err != nil {
 		editText(bot, chatID, msgID, "❌ "+err.Error())
@@ -1532,6 +1578,8 @@ func doUserAction(bot *tgbotapi.BotAPI, chatID int64, msgID int, action, name st
 }
 
 func doUserRenew(bot *tgbotapi.BotAPI, chatID int64, name string, days int) {
+	panelMu.Lock()
+	defer panelMu.Unlock()
 	u, err := findUser(name)
 	if err != nil {
 		send(bot, chatID, "❌ "+err.Error())
