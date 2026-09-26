@@ -771,9 +771,10 @@ func suiDelete(name string) error {
 }
 
 // xuiRenew resets usage and sets a fresh absolute expiry (now + days; 0 = never).
+// gb sets a new traffic limit (0 = unlimited); gb < 0 keeps the current limit.
 // It re-sends the client's current fields via the update API so nothing else
 // changes, then zeroes traffic (which also re-enables).
-func xuiRenew(name string, days int) error {
+func xuiRenew(name string, days int, gb int64) error {
 	db, err := sql.Open("sqlite3", xuiDBPath+"?_busy_timeout=5000")
 	if err != nil {
 		return err
@@ -791,6 +792,9 @@ func xuiRenew(name string, days int) error {
 	var expiryMs int64
 	if days > 0 {
 		expiryMs = time.Now().Add(time.Duration(days) * 24 * time.Hour).UnixMilli()
+	}
+	if gb >= 0 {
+		totalGB = gb * 1024 * 1024 * 1024
 	}
 	sec := security.String
 	if sec == "" {
@@ -812,7 +816,8 @@ func xuiRenew(name string, days int) error {
 }
 
 // suiRenew resets usage and sets a fresh absolute expiry (now + days; 0 = never).
-func suiRenew(name string, days int) error {
+// gb sets a new traffic limit (0 = unlimited); gb < 0 keeps the current limit.
+func suiRenew(name string, days int, gb int64) error {
 	db, err := sql.Open("sqlite3", suiDBPath+"?_busy_timeout=15000")
 	if err != nil {
 		return err
@@ -822,7 +827,13 @@ func suiRenew(name string, days int) error {
 	if days > 0 {
 		expiry = time.Now().Unix() + int64(days)*86400
 	}
-	if _, err := db.Exec(`UPDATE clients SET up=0, down=0, expiry=?, enable=1 WHERE name=?`, expiry, name); err != nil {
+	if gb >= 0 {
+		_, err = db.Exec(`UPDATE clients SET up=0, down=0, expiry=?, volume=?, enable=1 WHERE name=?`,
+			expiry, gb*1024*1024*1024, name)
+	} else {
+		_, err = db.Exec(`UPDATE clients SET up=0, down=0, expiry=?, enable=1 WHERE name=?`, expiry, name)
+	}
+	if err != nil {
 		return err
 	}
 	return suiRestartCore()
@@ -857,8 +868,15 @@ func toggleID(list []int64, id int64) []int64 {
 
 var sessions = map[int64]*wizardState{}
 
-// renewPending maps a chat to the username awaiting a renewal-days reply.
-var renewPending = map[int64]string{}
+// renewState tracks a two-step renew prompt: days first, then traffic GB.
+type renewState struct {
+	name     string
+	days     int
+	haveDays bool
+}
+
+// renewPending maps a chat to the renew prompt awaiting a reply.
+var renewPending = map[int64]*renewState{}
 
 // --- Bot ---
 
@@ -933,16 +951,31 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 	text := strings.TrimSpace(msg.Text)
 
-	// Awaiting renewal days for a user?
-	if name, ok := renewPending[chatID]; ok && !strings.HasPrefix(text, "/") {
-		delete(renewPending, chatID)
-		days, err := strconv.Atoi(strings.TrimSpace(text))
-		if err != nil || days < 0 {
-			send(bot, chatID, "❌ Please send a valid number of days (0 = never). Renew cancelled.")
+	// Awaiting renewal days / traffic for a user?
+	if r, ok := renewPending[chatID]; ok && !strings.HasPrefix(text, "/") {
+		if !r.haveDays {
+			days, err := strconv.Atoi(text)
+			if err != nil || days < 0 {
+				delete(renewPending, chatID)
+				send(bot, chatID, "❌ Please send a valid number of days (0 = never). Renew cancelled.")
+				return
+			}
+			r.days, r.haveDays = days, true
+			send(bot, chatID, "📦 Send the new traffic limit in *GB* (0 = unlimited, `-` = keep current):")
 			return
 		}
+		delete(renewPending, chatID)
+		gb := int64(-1)
+		if text != "-" {
+			v, err := strconv.ParseInt(text, 10, 64)
+			if err != nil || v < 0 {
+				send(bot, chatID, "❌ Please send a valid GB number (0 = unlimited, `-` = keep). Renew cancelled.")
+				return
+			}
+			gb = v
+		}
 		send(bot, chatID, "⏳ Renewing...")
-		go doUserRenew(bot, chatID, name, days)
+		go doUserRenew(bot, chatID, r.name, r.days, gb)
 		return
 	}
 
@@ -1059,7 +1092,7 @@ func handleCallback(bot *tgbotapi.BotAPI, cb *tgbotapi.CallbackQuery) {
 	case strings.HasPrefix(data, "uact:renew:"):
 		name := strings.TrimPrefix(data, "uact:renew:")
 		delete(sessions, chatID) // avoid wizard collision
-		renewPending[chatID] = name
+		renewPending[chatID] = &renewState{name: name}
 		editText(bot, chatID, msgID, fmt.Sprintf("🔄 Renew *%s*\n\nSend the number of *days* for the new period (0 = never expire):", name))
 		return
 	}
@@ -1577,7 +1610,7 @@ func doUserAction(bot *tgbotapi.BotAPI, chatID int64, msgID int, action, name st
 	showUserManage(bot, chatID, msgID, name)
 }
 
-func doUserRenew(bot *tgbotapi.BotAPI, chatID int64, name string, days int) {
+func doUserRenew(bot *tgbotapi.BotAPI, chatID int64, name string, days int, gb int64) {
 	panelMu.Lock()
 	defer panelMu.Unlock()
 	u, err := findUser(name)
@@ -1587,14 +1620,14 @@ func doUserRenew(bot *tgbotapi.BotAPI, chatID int64, name string, days int) {
 	}
 	var errs []string
 	if u.InXUI {
-		if e := xuiRenew(name, days); e != nil {
+		if e := xuiRenew(name, days, gb); e != nil {
 			errs = append(errs, "x-ui: "+e.Error())
 		} else {
 			reloadXray()
 		}
 	}
 	if u.InSUI {
-		if e := suiRenew(name, days); e != nil {
+		if e := suiRenew(name, days, gb); e != nil {
 			errs = append(errs, "s-ui: "+e.Error())
 		}
 	}
@@ -1602,13 +1635,19 @@ func doUserRenew(bot *tgbotapi.BotAPI, chatID int64, name string, days int) {
 	if days > 0 {
 		period = fmt.Sprintf("%d days (until %s)", days, time.Now().Add(time.Duration(days)*24*time.Hour).Format("2006-01-02"))
 	}
+	limit := "unchanged"
+	if gb == 0 {
+		limit = "unlimited"
+	} else if gb > 0 {
+		limit = fmt.Sprintf("%d GB", gb)
+	}
 	if len(errs) > 0 {
 		send(bot, chatID, fmt.Sprintf("⚠️ *%s* renew — some panels failed:\n`%s`", name, strings.Join(errs, "\n")))
 		return
 	}
 	send(bot, chatID, fmt.Sprintf(
-		"🔄 *%s renewed*\n\n📅 New period: %s\n📊 Traffic reset to 0\n🟢 Enabled\n\n🔗 Sub: `%s`",
-		name, period, subLink(name),
+		"🔄 *%s renewed*\n\n📅 New period: %s\n📦 Traffic limit: %s\n📊 Usage reset to 0\n🟢 Enabled\n\n🔗 Sub: `%s`",
+		name, period, limit, subLink(name),
 	))
 }
 
